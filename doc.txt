@@ -1,0 +1,98 @@
+Receiver<->Server Communication Protocol (RSCP)
+
+The document shall be defined in 2 sections:  Basic Protocol and Technical Details
+
+0.  Definitions
+
+Client commands are commands that the client may use to query or inform the server.
+Server commands are commands that the server may use to query or inform the client.
+In this "standard" KB, MB, and GB are 2^10 bytes, 2^20 bytes, and 2^30 bytes respectively.
+
+LF is a sequence in ascii, "\n".  Shall be used to indicate ends of lines as well as end of content.
+
+1.  Basic Protocol
+
+There are various basic concepts that the protocol must handle, such as connection, extra-info, logging, and eventually network configuration and the reports themselves.
+
+Connection:
+	1.  Client connects and sends an connection packet describing itself within 5 seconds of connection.
+	2.  If client sends a valid connection packet before the 5 seconds are over, the server should keep the connection open, otherwise the server should close it.
+	3.  Server sends back an acknowledgement informing the client of the maximum version it supports.
+
+Heartbeat:
+	1.  Client must send a heartbeat packet every 10 seconds after connection.
+	2.  If server does not get a heartbeat packet from a receiver within 20 seconds of the last heartbeat or connection packet, it must send one to the receiver in order to see if the connection is up.
+	3.  If the client's heartbeat send fails, it must try to reconnect to the server once every 10 seconds.
+
+All other concepts are delineated into their own commands and command sets.  The formats of the commands are defined in section 2.
+
+Extra-info:
+	
+Logging:
+	Client commands:
+		In versions:  >=0
+		```
+		LOG
+		level: specifiedlevel
+		message: Message here
+		timestamp: unix timestamp here
+
+		```
+			This allows a client to inform the server of an error.
+			
+
+	Server commands:
+
+Network configuration:
+	Client commands:
+	Server commands:
+
+2.  Technical Details
+
+In order to simplify implementation, the protocol shall be text based.
+The chosen port on the server honestly doesn't matter.  I'll choose port 14434 for preliminaries.
+
+Packets shall end with two LFs in a row, one for the last content line, and one on a line by itself to indicate the end of the content.
+
+Connection packet shall be less than 1KB in size.  If the server gets more than 1KB of data on connection, the server should disconnect the client to help prevent DoS attacks.
+
+Connection packet is defined below:
+
+CONNECT LF
+id: <network/receiver ID> LF
+version: <version num> LF
+LF
+
+If the first word in this packet is not "CONNECT", the server shall disconnect the client.
+
+If the server registers the receiver as valid, it shall send an acknowledgement (see below)
+
+CONNECT LF
+ack: success LF
+version: version_num LF
+LF
+
+Every 10 seconds, the receiver must send a "heartbeat" packet (see below)
+
+Due to the way TCP works, the receiver will get a SIGPIPE if it tries to write to a socket with a broken connection[citation needed].  This allows us to detect whether the network has gone down, and log it locally as necessary.  Therefore, the server must also send a heartbeat packet 20 seconds after the last client heartbeat packet, in order to confirm the connection as broken.
+
+HEARTBEAT LF
+LF
+
+All other concepts are delineated into their own commands and command sets.  Here are the formats of the commands
+
+Logging:
+	Client commands:
+		```
+		LOG
+		level: specifiedlevel
+		message: Message here
+		timestamp: unix timestamp here
+
+		```
+			Due to the design of the protocol, newlines are not currently supported in any way.
+			message is the message line for the server to store in some way.
+			level can be any of the following values:
+				debug, info, warning, error
+
+			timestamp should be a unix epoch timestamp, in seconds.  If timestamps, for some reason, are not supported on the receiver, the specified timestamp shall be zero.
