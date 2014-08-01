@@ -10,6 +10,12 @@ import logging
 
 import datetime
 
+import MySQLdb as mdb
+import constants
+from constants import DB_Connect
+
+constants.initConstants()
+
 VERSION = 1
 
 logging.basicConfig(level=logging.INFO)
@@ -66,7 +72,7 @@ class ClientSocket(object):
 		self.socket = sock
 		self.lastHeartbeat = time.time()
 		self.buffer = ""
-		self.isDisconnected = False
+		self.isDisconnected = True # It is disconnected until heartbeat handled for the first time.
 		self.disconnectCause = ""
 		self.id = ""
 		self.version = 0
@@ -95,17 +101,20 @@ class ClientSocket(object):
 			# 0 length data without errors would indicate that the other endpoint has been
 			# disconnected, most likely through software action.
 			if len(tryData) == 0:
-				self.isDisconnected = True
-				self.disconnectCause = "software"
-
+				self.setDisconnected(True)
+				
 			self.buffer += tryData
 			
 		except socket.error, e:
 			err = e.args[0]
-			if err != errno.EAGAIN and err != errno.EWOULDBLOCK:
+			if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+				pass
+			elif err == errno.EPIPE or err == errno.ECONNRESET:
+				self.setDisconnected(True)
+			else:
 				print 'baderr', err
 				# TODO:  Improve the error handling.
-
+			
 	def checkForEndOfContent(self):
 		if len(self.buffer) < 2:
 			return False # End of content indicator is 2 bytes long.
@@ -122,6 +131,65 @@ class ClientSocket(object):
 			content = RSCPContent()
 			content.loadFromString(dataStr)
 			return content
+	
+	def handleHeartbeat(self, mysql, heartbeatTime):
+		cur = mysql.cursor(mdb.cursors.DictCursor)
+		
+		print "handling heartbeat."
+
+		if self.isDisconnected:
+			self.isDisconnected = False
+			
+			with mysql:
+				cur.execute("""INSERT INTO receivers_online
+					(`receiver_id`, `event`, `date_logged`)
+					VALUES (%s, %s, %s)
+				""", (self.id, "online", long(time.time())))
+		
+		self.lastHeartbeat = time.time()
+
+		cur.close()
+
+	def send(self, data):
+		while True:
+			try:
+				self.socket.send(data)
+
+				# We want to try again if the send failed for some reason
+				# This break is never reached if something goes wrong with send.
+				break
+			except socket.error, e:
+				err = e.args[0]
+				if err == errno.EAGAIN or err == errno.EWOULDBLOCK:
+					time.sleep(0.1)
+					continue
+				elif err == errno.EPIPE or err == errno.EBADF:
+					self.setDisconnected(True)
+					self.close()
+					break
+				else:
+					raise e
+	
+	def setDisconnected(self, disconnected):
+		global mysql
+			
+		if disconnected and not self.isDisconnected:
+			self.isDisconnected = disconnected
+
+			try:
+				mysql.ping(True)
+			except:
+				print 'something happened with ping.  ignoring.'
+
+			cur = mysql.cursor(mdb.cursors.DictCursor)
+
+			with mysql: # Notify the database that the receiver is now offline.
+				cur.execute("""INSERT INTO `receivers_online`
+					(`receiver_id`, `event`, `date_logged`)
+					VALUES (%s, %s, %s)
+				""", (self.id, "offline", long(time.time())))
+			
+			cur.close()
 
 	def close(self):
 		self.socket.close()
@@ -130,9 +198,12 @@ clientSockets = []
 
 threadComms = []
 
+mysql = DB_Connect()
+
 def ClientSocketCommunicatorThread(threadNum):
 	global threadComms
 	global clientSockets
+	global mysql
 
 	# We want to go through these sockets once every 100 ms.
 
@@ -142,7 +213,7 @@ def ClientSocketCommunicatorThread(threadNum):
 		for sockData in clientSockets:
 			if not sockData.isDisconnected:
 				sockData.getDataFromSocket()
-
+			
 			if sockData.checkForEndOfContent():
 				content = sockData.getContent()
 
@@ -151,9 +222,11 @@ def ClientSocketCommunicatorThread(threadNum):
 				# Handle the content.
 				if content.request == "HEARTBEAT":
 					# heartbeat!
-					logging.debug("heartbeat " + sockData.id)
-					sockData.lastHeartbeat = time.time()
-					sockData.isDisconnected = False
+					logging.debug("heartbeat " + str(sockData.id))
+					sockData.handleHeartbeat(mysql, time.time())
+
+					#sockData.lastHeartbeat = time.time()
+					#sockData.isDisconnected = False
 				elif content.request == "LOG":
 					# log request!
 
@@ -179,17 +252,13 @@ def ClientSocketCommunicatorThread(threadNum):
 					logfile.close()
 
 			# Do a heartbeat check on this socket.
-			if sockData.lastHeartbeat + HEARTBEAT_TIMEOUT < time.time():
-				try:
-					sockData.socket.send("HEARTBEAT\n\n")
-				except:
-					print "Removing socketData"
-					clientSockets.remove(sockData)
+			if not sockData.isDisconnected and sockData.lastHeartbeat + HEARTBEAT_TIMEOUT < time.time():
+				sockData.send("HEARTBEAT\n\n")
 
 				# TODO Implement some sort of SIGPIPE handler or something here.
 
 		endTime = time.time()
-		if endTime > startTime + 0.1:
+		if endTime < startTime + 0.1:
 			time.sleep(0.1 - (endTime - startTime))
 
 
@@ -224,6 +293,20 @@ try: # This try-except-finally is to catch any previously uncaught exceptions, s
 				# Invalid connection.
 				clientSocket.close()
 				continue
+			else:
+				# Search for ID already existing in client sockets.
+				clientSocket.id = long(data.data['id'])
+				clientSocket.handleHeartbeat(mysql, time.time())
+				
+				replacedClientSocket = False
+				for (i, sockData) in enumerate(clientSockets):
+					if sockData.id == clientSocket.id:
+						sockData.close()
+						clientSockets[i] = clientSocket
+						replacedClientSocket = True
+
+				if not replacedClientSocket:
+					clientSockets.append(clientSocket)
 
 			if 'version' not in data.data:
 				clientSocket.version = 0
